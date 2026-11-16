@@ -1,8 +1,20 @@
 name: npgsql-repro-6031
 
+# Shared settings for the two scenarios. Run one at a time: `docker compose run --rm race` or `... alias`.
+# They need the database but no schema or data.
+x-scenario: &scenario
+  profiles: ["scenarios"]
+  depends_on:
+    db:
+      condition: service_healthy
+  environment:
+    REPRO_CONNECTION: "Host=db;Port=5432;Database=repro;Username=postgres;Password=postgres"
+
 services:
   db:
     image: postgres:14
+    # Headroom for the scenarios' large client pool, which keeps leaked slots from starving the bystanders.
+    command: ["postgres", "-c", "max_connections=400"]
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -17,26 +29,22 @@ services:
       timeout: 5s
       retries: 30
 
-  repro:
+  # A DI scope ends while fire-and-forget work on its DbContext still runs.
+  #   docker compose run --rm race [--registration plain|pool] [--seconds 5] [--quiet 20] [--loops 16] [--bystanders 8]
+  race:
+    <<: *scenario
     build:
       context: .
-      dockerfile: src/Repro/Dockerfile
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      ConnectionStrings__Default: "Host=db;Port=5432;Database=repro;Username=postgres;Password=postgres"
-      # Every Repro:* setting in src/Repro/appsettings.json can be overridden here or with `docker compose run -e`.
-      # Repro__Container: Autofac                   # MsDi | Autofac
-      # Repro__ContextRegistration: PooledFactory   # Plain | Pool | PooledFactory
-      # Repro__AliasRegistration: "true"            # scope tracks the context twice
-      # Repro__ExtraDisposeProbability: "0.2"       # app code disposes the injected context
-      # Repro__Concurrency: "32"
-      # Repro__ScopeDisposal: Sync                  # Async | Sync
-      # Repro__DoubleDisposeMode: PassThroughSwallow # PassThrough | PassThroughSwallow | Skip
-      # Repro__CancelProbability: "0.2"
-      # Repro__AbandonReaderProbability: "0.1"      # needs Repro__RetryOnFailure: "false"
-      # Repro__RetryOnFailure: "false"
-      # Repro__Interval: "00:05:00"
-      # Repro__Duration: "00:01:00"
-      # Repro__SelfTest: "true"
+      dockerfile: src/Dockerfile
+      args:
+        PROJECT: Repro.Race
+
+  # AddPooledDbContextFactory plus a forwarding interface registration: the scope disposes the context twice.
+  #   docker compose run --rm alias [--registration factory|pool] [--resolve alias|direct] [--seconds 20] [--quiet 20]
+  alias:
+    <<: *scenario
+    build:
+      context: .
+      dockerfile: src/Dockerfile
+      args:
+        PROJECT: Repro.Alias

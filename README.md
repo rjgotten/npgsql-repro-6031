@@ -1,169 +1,243 @@
-# Repro harness for npgsql/npgsql#6031
+# Repro for npgsql/npgsql#6031
 
-[npgsql/npgsql#6031](https://github.com/npgsql/npgsql/issues/6031) ("NpgsqlDataReader.Close is open to race
-condition") reports pods running out of memory, with dumps full of `ObjectDisposedException`s. Their async state
-machines point at `NpgsqlDataReader.Consume`, reached through `DbContext.DisposeAsync` → `NpgsqlDataReader.CloseAsync`
-when a DI scope tears down. The maintainers' position is that none of these types are thread-safe, so something must be
-disposing concurrently. They closed the issue because no repro existed.
+[npgsql/npgsql#6031](https://github.com/npgsql/npgsql/issues/6031) reported pods running out of memory, with heaps
+full of `ObjectDisposedException`s whose state machines pointed at `NpgsqlDataReader.Consume`, reached through
+`DbContext.DisposeAsync`. This repository reproduces that failure in two minimal scenarios.
 
-This solution reproduces the setup from the issue and instruments the one place where concurrent disposal would show
-up: the `DbContext` itself.
+**In short:** when two parties drive one Npgsql connection at once (for example a close racing an in-flight
+read), the connection's protocol state is corrupted. Npgsql then fails unsafely:
 
-## What it does
+- Damaged connections go back into the connection pool, where valid contexts in their own scopes pick them up and
+  fail, or hang indefinitely in a query despite the command timeout and a cancelled token.
+- A corrupted length field becomes a huge buffer allocation in `NpgsqlReadBuffer.AllocateOversize`, which throws
+  `OutOfMemoryException` on the issue's own `Close → Consume → NextResult` path.
+- Pool slots whose close throws are never returned.
 
-- **`TranslationsContext`** ([src/Repro/Data/TranslationsContext.cs](src/Repro/Data/TranslationsContext.cs)) overrides
-  `DisposeAsync()` and `Dispose()`. Both go through one `Interlocked.CompareExchange` gate. The first call wins.
-  Every later call is a **double disposal** and is logged with both callers, both thread ids, the time between them,
-  and both stack traces. It is classified as:
-  - **Concurrent**: the first disposal was still running. This is the race the issue suspects.
-  - **Sequential**: the first disposal had already finished.
-- **Registration** matches the issue: `AddDbContext` + `UseNpgsql(...)` with `SetPostgresVersion(14, 13)` and
-  `EnableRetryOnFailure(1, 0.5s, null)`, plus a scoped `SqlTranslationsRepository` that runs
-  `.AsNoTracking().Where(t => t.TenantId == ...).ToArrayAsync(ct)`.
-- **`ReproWorker`** runs `Concurrency` loops in parallel. Each iteration creates a DI scope, runs the query, and lets
-  the scope dispose the context. Some queries get a token that cancels a few milliseconds in, so disposal can land
-  while a reader is mid-flight.
-- **Container** is switchable between Microsoft.Extensions.DependencyInjection and Autofac.
-- **`SummaryReporter`** logs one line of counters every 10 seconds, at Warning level once any double disposal has
-  been seen.
+How two parties end up on one connection is application-specific. The two scenarios are the two ways we found:
+
+| Scenario | How the concurrency arises |
+|---|---|
+| [Race](src/Repro.Race/Program.cs) | A DI scope ends while fire-and-forget work it started on its DbContext is still reading. This is what happened in the application behind the issue. |
+| [Alias](src/Repro.Alias/Program.cs) | `AddPooledDbContextFactory` plus an interface registration that forwards to the context. The scope disposes the context twice, and the second disposal returns another scope's context to the pool mid-use. |
 
 ## Running
 
-With Docker only:
+Docker only; the database needs no schema or data. Run one scenario at a time:
 
 ```sh
-docker compose up --build            # Postgres 14 (stock image) + the repro app, default settings
-docker compose down -v               # stop and remove the database volume
+docker compose run --rm race
+docker compose run --rm alias
+docker compose run --rm alias --registration pool     # control: AddDbContextPool absorbs the double disposal
+docker compose run --rm alias --resolve direct        # control: the context is disposed once
+docker compose down -v
 ```
 
-Override any setting per run with `-e Repro__<Setting>=<value>`:
-
-```sh
-# Prove the detector works: one deliberate Concurrent + one Sequential double disposal at startup.
-docker compose run --rm --build -e Repro__SelfTest=true -e Repro__Duration=00:00:20 repro
-
-# Autofac, synchronous scope disposal, one minute.
-docker compose run --rm -e Repro__Container=Autofac -e Repro__ScopeDisposal=Sync -e Repro__Duration=00:01:00 repro
-```
-
-Against the compose database from the host (port 5432; set `POSTGRES_PORT` to remap):
+Or against the compose database from the host (.NET 10 SDK):
 
 ```sh
 docker compose up -d db
-dotnet run --project src/Repro -- --Repro:Container=Autofac --Repro:Duration=00:01:00
+dotnet run --project src/Repro.Race
+dotnet run --project src/Repro.Alias -- --registration pool
 ```
 
-The exit code is `1` when the self-test fails, and `0` otherwise.
-
-## Settings (`Repro:*`)
-
-| Setting | Default | Meaning |
+| Argument | Default | Meaning |
 |---|---|---|
-| `Container` | `MsDi` | `MsDi` or `Autofac`. Swap in a custom `IServiceProviderFactory` in `Program.cs` to test your own container. |
-| `ContextRegistration` | `Plain` | `Plain` (`AddDbContext`), `Pool` (`AddDbContextPool`) or `PooledFactory` (`AddPooledDbContextFactory`, which also registers a scoped context created through the factory). See [Pooling](#pooling). |
-| `AliasRegistration` | `false` | Also register the context as `ITranslationsContext` through a factory and resolve it under both types in every scope. The scope then tracks the one instance twice and disposes it twice. |
-| `ExtraDisposeProbability` | `0` | Chance that app code disposes the injected context itself (as `await using` over a DI-owned context would), before the scope disposes it again. |
-| `Concurrency` | `32` | Parallel scope/query loops. |
-| `ScopeDisposal` | `Async` | `Async` (`await using CreateAsyncScope()`, so the container calls `DisposeAsync`) or `Sync` (`using CreateScope()`, so it calls `Dispose`). |
-| `DoubleDisposeMode` | `PassThrough` | What a detected repeat disposal does next. `PassThrough`: call base disposal, exceptions propagate. `PassThroughSwallow`: call base disposal, and log, count and swallow any exception. `Skip`: don't call base disposal. |
-| `CancelProbability` | `0.2` | Chance that a query's token cancels after a random delay. |
-| `MaxCancelDelayMs` | `5` | Upper bound of that delay. |
-| `AbandonReaderProbability` | `0` | Chance to read 3 rows and abandon the enumerator, which leaves the reader open until the context is disposed. Only effective with `RetryOnFailure=false`, because a retrying execution strategy makes EF buffer the full result set and close the reader immediately. |
-| `RetryOnFailure` | `true` | Toggle `EnableRetryOnFailure(1, 0.5s, null)`. |
-| `Interval` | `00:00:00` | Delay between iterations per loop. Use `00:05:00` for the issue's cadence. |
-| `Duration` | unset | Stop after this long. Unset means run until stopped. |
-| `SummaryInterval` | `00:00:10` | Counter log cadence. |
-| `SeedRows` / `Tenants` | `5000` / `10` | Seed data, inserted once into an empty table. |
-| `SelfTest` | `false` | Run the deliberate double-dispose check before starting the load. |
-| `CaptureFirstDisposerStack` | `true` | Capture a stack trace on every first disposal so a later double disposal can show who went first. Turn off to reduce overhead; the second disposer's stack is always captured. |
-| `MaxDetailedLogs` | `50` | Per category (double disposals, dispose exceptions, iteration errors), how many events are logged in full before they are only counted. |
+| `--registration` | `plain` (race), `factory` (alias) | Race: `plain` (`AddDbContext`) or `pool` (`AddDbContextPool`). Alias: `factory` (`AddPooledDbContextFactory`) or `pool` (`AddDbContextPool`). |
+| `--resolve` | `alias` | Alias only: `alias` resolves the interface (disposed twice), `direct` resolves the context (disposed once). |
+| `--seconds` | `5` (race), `20` (alias) | How long the trigger runs. |
+| `--quiet` | `20` | How long the bystanders run on their own afterwards. |
+| `--loops` | `16` | Parallel trigger loops. |
+| `--bystanders` | `8` | Parallel bystander loops. |
+| `--pool-size` | `300` | Npgsql `MaxPoolSize`, sized so leaked slots don't starve the bystanders. The compose database allows 400 connections. |
 
-Raise `Logging__LogLevel__Microsoft.EntityFrameworkCore` (or `Npgsql`) to `Debug` for more detail. EF logs its own
-`ContextDisposed` event at Debug.
+The exit code is 1 when a bystander failed, a lease was stolen, or pool slots leaked.
 
-## Reading the output
+## What each run does
 
-A detection looks like this:
+Both projects use stock Microsoft.Extensions.DependencyInjection and console logging, and share
+[src/Shared](src/Shared):
+
+- **[ReproContext](src/Shared/ReproContext.cs)** overrides `Dispose`/`DisposeAsync` and logs, with the disposer's
+  stack, a disposal that arrives while an operation still runs on the context (`DISPOSED WHILE IN USE`), and a
+  second disposal within one lease, found through an `Interlocked.CompareExchange` gate (`DOUBLE DISPOSAL`,
+  concurrent or sequential). Disposal always proceeds into EF unchanged.
+- **[Bystanders](src/Shared/Bystanders.cs)** are valid contexts: each loop creates its own scope, resolves its own
+  context, awaits one query, checks every row and lets the scope dispose the context once. They share only the
+  registration with the trigger, and so EF's context pool (where there is one) and Npgsql's connection pool.
+- **[Scenario](src/Shared/Scenario.cs)** runs the trigger next to the bystanders, then lets abandoned trigger work
+  drain, then runs the bystanders alone ("quiet"), then probes how many Npgsql pool slots are still checked out.
+  Every wait is bounded, and blocked loops are reported with where they are stuck.
+
+The first three of each kind of event are logged in full, with stacks; after that they are counted. The first
+failure that goes through `NpgsqlDataReader.Consume` is logged as `ISSUE STACK`. A summary follows at the end.
+
+## The two scenarios
+
+### Race
 
 ```text
-warn: Repro.Data.TranslationsContext[0]
-      DOUBLE DISPOSAL of TranslationsContext #1234 (Concurrent): DisposeAsync on thread 17 came 0.412 ms after
-      DisposeAsync on thread 9. DoubleDisposeMode=PassThrough.
-      --- second disposer ---
-         at ...
-      --- first disposer ---
-         at ...
+trigger: owner thread                            trigger: fire-and-forget work
+---------------------                            ----------------------------
+scope = CreateAsyncScope()
+context = resolve ReproContext                   context.Database.SqlQueryRaw(...).ToListAsync()
+                                                   reading rows from the connection
+await scope.DisposeAsync()
+  → DbContext.DisposeAsync
+  → NpgsqlConnection.CloseAsync
+  → NpgsqlDataReader.Close → Consume   ◄── same connection ──►   still reading
+connection goes back to the pool, or stays checked out
 ```
 
-The summary line reports `doubleDisposals concurrent=… sequential=…`. Exceptions thrown from the base disposal are
-counted under `disposeExceptions objectDisposed=… invalidOperation=… other=…`, which is where the issue's
-`ObjectDisposedException` would show up.
+With `--registration pool`, the scope also returns the context itself to EF's pool while the work still uses it.
 
-The other counters:
+### Alias
 
-| Counter | Meaning |
-|---|---|
-| `contexts` | `TranslationsContext` instances constructed. With pooling, this stays near `Concurrency`. |
-| `leases` | Rents from the pool (pooled modes only). |
-| `firstDisposals` | Disposal calls that won the gate. With pooling this equals `leases` when the scope disposes every pooled context exactly once. |
-| `poolTeardowns` | Disposals issued by the pool itself (overflow, pool disposal). These are not gated or counted as doubles. |
-| `stolenLeases` | A scope's context switched to a different lease before the scope ended: another owner rented the same instance while it was still in use. |
+`AddPooledDbContextFactory` has no service/implementation overload like `AddDbContext<TService, TImpl>` or
+`AddDbContextPool<TService, TImpl>`, so exposing the context through an interface takes a forwarding registration:
 
-## Pooling
+```csharp
+services.AddPooledDbContextFactory<ReproContext>(options => options.UseNpgsql(dataSource));
+services.AddScoped<IReproContext>(sp => sp.GetRequiredService<ReproContext>());
+```
 
-With pooling, one instance serves many leases. `TrackingDbContextPool`
-([src/Repro/Data/TrackingDbContextPool.cs](src/Repro/Data/TrackingDbContextPool.cs)) subclasses EF's `DbContextPool<T>`
-to re-arm the gate on every `Rent()`. It also marks the pool's own `Dispose` calls so they are not reported. Both pooled
-registrations make the DI scope own the context (EF registers it as a scoped factory, which the scope captures). They
-differ in what the context's own `Dispose` does:
+Resolving `IReproContext` resolves `ReproContext`, which the scope tracks, and returns the same instance, which the
+scope tracks again. The scope disposes it twice. The scoped context of a pooled factory holds a standalone lease, so
+its own `Dispose` returns it to the pool:
 
-- **`AddDbContextPool`**: the context holds a *non-standalone* lease, so `DbContext.Dispose[Async]` is a no-op. The
-  context goes back to the pool when the scope disposes the separate `ScopedDbContextLease`. Disposing the context
-  twice is harmless.
-- **`AddPooledDbContextFactory`**: the scoped context is created by `factory.CreateDbContext()` with a *standalone*
-  lease, so `DbContext.Dispose[Async]` itself returns the context to the pool. A second disposal is a no-op only until
-  someone else rents that instance. After that, it resets the new owner's context and returns it to the pool while
-  the new owner is still using it.
+```text
+scope 1                                         scope 2
+-------                                         -------
+resolve IReproContext → instance X, lease n
+query, done
+dispose (interface entry): X back to the pool
+                                                rent X, lease n+1 (EF resets _disposed)
+                                                query starts, reader open
+dispose (context entry): X now holds lease n+1,
+  so DbContext.DisposeAsync returns X to the
+  pool → ResetStateAsync → NpgsqlConnection
+  .CloseAsync → NpgsqlDataReader.Close → Consume ◄── still reading on the same connection
+                                                a third scope may now rent X as well
+```
+
+Under `AddDbContextPool` the scoped context holds a non-standalone lease and its own `Dispose` does nothing (the
+separate scoped lease object returns it), and under `AddDbContext` the second `Dispose` is guarded by `_disposed`.
+Both absorb the same double disposal.
+
+## Results
+
+Short runs in Docker on one machine (EF Core 10.0.4, Npgsql 10.0.3, PostgreSQL 14).
+
+| Run | Trigger iterations | Bystander queries (failures) during trigger | After trigger | Pool slots still checked out |
+|---|---:|---:|---|---:|
+| `alias` (10 s) | 39,113 | 548 (94) | all 8 bystanders blocked in their query | 77 of 300 |
+| `alias --registration pool` (10 s) | 36,890 | 24,427 (0) | 55,904 queries, 0 failures | 0 |
+| `alias --resolve direct` (10 s) | 40,416 | 26,227 (0) | 55,948 queries, 0 failures | 0 |
+| `race` (5 s) | 457 | 29,581 (10) | 119,247 queries, 0 failures | 21 of 300 |
+| `race --registration pool` (5 s) | 518 | 17,515 (41) | 149,727 queries, 0 failures | 15 of 300 |
+
+A second `alias` run reproduced the same picture: 63 bystander failures in 528 queries, all 8 bystanders blocked,
+70 pool slots leaked.
 
 ## Findings
 
-20–30 s runs, 32 loops, with the issue's provider settings. "Double disposal" here means the scope disposes the context
-twice (`AliasRegistration=true`) or app code disposes it before the scope does (`ExtraDisposeProbability=0.2`).
+### 1. Concurrent use of one connection damages it, and the pool hands it to valid code
 
-| Registration | Double disposal? | Result |
-|---|---|---|
-| `Plain`, `Pool`, `PooledFactory` (MS DI and Autofac, async and sync scopes) | no | 0 double disposals, 0 stolen leases, 0 errors. With pooling, `leases == firstDisposals`. |
-| `Plain` | yes | Every second disposal detected as Sequential; EF treats it as a no-op. No errors. |
-| `Pool` | yes | Every second disposal detected as Sequential; EF treats it as a no-op. No errors. |
-| `PooledFactory` | yes, MS DI or Autofac | Stolen leases, Concurrent double disposals, and Npgsql protocol corruption. |
+Once two parties drive one connection, its protocol state is corrupted, and the connection goes back into
+Npgsql's pool. Valid contexts, each in its own scope and used correctly, then pick it up. While the trigger ran,
+they failed with:
 
-The `PooledFactory` corruption shows up as these errors:
+- Protocol desync: `Internal Npgsql bug: unexpected value 0 of enum BackendMessageCode. Please file a bug.`,
+  `Received backend message BindComplete while expecting ReadyForQueryMessage. Please file a bug.`,
+  `Source array was not long enough`, `The read on this field has consumed all of its bytes`.
+- Another party's query on their connection: `A command is already in progress: SELECT g AS "Value" ...`.
+- A context that another scope is using (alias, and race with `--registration pool`):
+  `A second operation was started on this context instance`, `Cannot access a disposed context instance`.
 
-- `Row's number of columns (30840) differs from the row description's (4)`
-- `Can't close, connection is in state Connecting`
-- `The read on this field has not consumed all of its bytes`
-- `Internal Npgsql bug: unexpected value 0 of enum BackendMessageCode`
-- Hundreds of `ObjectDisposedException`s
+Several of these messages ask the user to file an Npgsql bug, although the cause is concurrent use upstream.
 
-The errors thrown *during disposal* follow the call path in the issue:
+### 2. Valid contexts can hang indefinitely
+
+In both `alias` runs, all 8 bystanders ended up blocked inside their query (`ToListAsync`). They were still blocked
+15 s after their cancellation token was cancelled, with a 5 s command timeout in effect. Neither the timeout nor
+the cancellation released them. One trigger loop blocked the same way in the first run. In the race runs no
+bystander blocked, and all trigger work that hung for more than 2 s had ended by the end of the 15 s drain.
+
+### 3. A corrupted length field becomes an `OutOfMemoryException` on the issue's path
+
+When the stream is desynced, Npgsql reads a garbage message length and tries to allocate a buffer that size
+(lengths around 2 billion bytes were seen in other errors, such as `len: 2021161080`). It happened in both race runs:
+
+- `race`: 34 times in the trigger (18 in the work, 16 in the scope's disposal) and once in a bystander.
+- `race --registration pool`: at least 3 times in the trigger and once in a bystander.
+
+The stack is the issue's own `Close → Consume → NextResult` path:
 
 ```text
-at Npgsql.NpgsqlDataReader.NextResult(...)
-at Npgsql.NpgsqlDataReader.Consume(...)
-at Npgsql.NpgsqlDataReader.Close(...)
-at Npgsql.Internal.NpgsqlConnector.CloseOngoingOperations(...)
-at Npgsql.NpgsqlConnection.CloseAsync(...)
-at Microsoft.EntityFrameworkCore.Storage.RelationalConnection.ResetStateAsync(...)
-at Microsoft.EntityFrameworkCore.DbContext...IResettableService.ResetStateAsync(...)
-at Microsoft.EntityFrameworkCore.Internal.DbContextPool`1.ReturnAsync(...)
-at Microsoft.EntityFrameworkCore.DbContext.DisposeAsync()
+System.OutOfMemoryException
+   at System.Buffers.SharedArrayPool`1.Rent(Int32 minimumLength)
+   at Npgsql.Internal.NpgsqlReadBuffer..ctor(...)
+   at Npgsql.Internal.NpgsqlReadBuffer.AllocateOversize(Int32 count)
+   at Npgsql.Internal.NpgsqlConnector.ReadMessageLong(...)
+   at Npgsql.NpgsqlDataReader.NextResult(...)
+   at Npgsql.NpgsqlDataReader.Consume(...)
+   at Npgsql.NpgsqlDataReader.Close(...)
+   at Npgsql.Internal.NpgsqlConnector.CloseOngoingOperations(...)
+   at Npgsql.NpgsqlConnection.CloseAsync(...)
 ```
 
-That is the *repeat* disposer: it returns the context to the pool, and resetting the context closes a connection
-whose reader belongs to the instance's new owner.
+In a container with a memory limit, an allocation attempt of that size may end the process instead of throwing.
+The pods in the issue were being OOM-killed with `Consume` frames on the heap. That is consistent with this
+finding, but not proven by it.
 
-## Scope limits
+### 4. Leaked pool slots are never returned
 
-- The internal multi-tenant Autofac factory is not included. Plain `AutofacServiceProviderFactory` stands in for it.
-- The gate re-arm on `Rent()` is not atomic against a stray disposal racing it. Such a disposal is still detected,
-  but it can be attributed to the new lease. `stolenLeases` is the unambiguous signal.
+When a close throws partway through, the connection's pool slot stays checked out. After all work stopped and a
+full GC, 15 to 77 of 300 slots were still checked out, depending on the run. Nothing reclaims them, so an
+application that keeps hitting this eventually exhausts its pool.
+
+### 5. Damaged connections do not linger once the misuse stops
+
+In the race runs, the bystanders ran clean once the trigger stopped: 0 failures in 119,247 and 149,727 queries. (In
+the alias runs every bystander was already blocked by then.) The lasting effects are the blocked calls and the
+leaked slots, not corrupted connections waiting in the pool.
+
+### 6. Only `AddPooledDbContextFactory` turns a double disposal into shared use
+
+A scope that disposes its context twice is harmless under `AddDbContextPool` and `AddDbContext` (the controls:
+0 failures, 0 leaked slots). Under `AddPooledDbContextFactory` the scoped context holds a standalone lease, and the
+second disposal returns another scope's context to the pool. Since that registration has no service/implementation
+overload, exposing the context through an interface needs exactly the forwarding registration that causes this.
+
+### 7. In the application behind the issue, it was the race
+
+The application's own trigger was a cache whose first fill was started on a request's scope without being awaited.
+When the request returned early, its scope disposed the context while the fill was still reading from it. That is
+the race scenario. The dumps' `DbContext.DisposeAsync` frame fits: the request scope is disposed asynchronously,
+while the cache's periodic refreshes used separate scopes disposed synchronously. Switching the repository to
+`IDbContextFactory` with a method-local `using` removed the dependency on the request's context, which is why that
+change worked around the problem.
+
+### 8. Possible hardening
+
+These are suggestions for discussion, not tested fixes.
+
+- **Npgsql: detect concurrent use atomically.** Existing checks ("A command is already in progress", "Can't close,
+  connection is in state Connecting") read the state and then act on it, so real concurrency gets past them. An
+  atomic state transition on entry to the read and close paths would turn a desync into a clear "concurrent use of
+  connection" exception. That is detection, not thread safety.
+- **Npgsql: never return a connection that may still be in use.** When a close finds another operation active, or
+  the stream is out of sync, break the connector instead of pooling it, and release its slot when the close fails.
+- **Npgsql: treat an implausible message length as corruption.** Break the connector instead of allocating a
+  buffer for it.
+- **Npgsql: honor command timeout and cancellation on a desynced connection**, so a valid caller fails instead of
+  hanging.
+- **Npgsql: reword "please file a bug"** on desync errors to mention concurrent use of a connection as a likely
+  cause.
+- **EF Core: give `AddPooledDbContextFactory`'s scoped context a non-standalone lease**, as `AddDbContextPool`
+  does, so a double disposal of a DI-resolved context is harmless.
+
+### A note on rates
+
+The alias failure rate depends on timing: a scope's two disposals are close together, and the instrumentation's
+stack capture on every disposal widens that window. An uninstrumented version reproduced the same failures at a
+lower rate (18 errors in about 141,000 iterations). The controls stay clean with the same instrumentation.
